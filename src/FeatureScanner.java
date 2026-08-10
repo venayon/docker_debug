@@ -1,4 +1,4 @@
-package uk.gov.dwp.gysp.acceptancetests.util;
+
 
 import io.cucumber.junit.platform.engine.Constants;
 import org.junit.platform.suite.api.ConfigurationParameter;
