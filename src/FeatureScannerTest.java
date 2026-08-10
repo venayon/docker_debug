@@ -1,4 +1,4 @@
-package uk.gov.dwp.gysp.acceptancetests.util;
+
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
