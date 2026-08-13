@@ -49,7 +49,7 @@ does time out.
 
 ## `WaitUtil` (Selenium / web elements)
 
-**Package:** `uk.gov.dwp.gysp.acceptancetests.utils.WaitUtil`
+**Package:** `com.a.b.c`
 
 Handles clicking and reading text off elements, resiliently. **Never
 throws** for ordinary timing problems — every method returns `false` /
