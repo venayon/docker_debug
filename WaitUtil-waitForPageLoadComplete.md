@@ -22,7 +22,24 @@ before giving up.
 ## Signature
 
 ```java
-public static boolean waitForPageLoadComplete(final WebDriver driver)
+/**
+ * Waits (up to {@link #WAIT_TIME}) for the browser to report the page
+ * as fully loaded ({@code document.readyState === "complete"}).
+ *
+ * @return true if the page reported "complete" within the wait; false
+ *         on timeout or any error (e.g. driver doesn't support JS) -
+ *         never throws
+ */
+public static boolean waitForPageLoadComplete(final WebDriver driver) {
+    return waitForCondition(driver, "page load complete (document.readyState)",
+            d -> {
+                if (!(d instanceof JavascriptExecutor js)) {
+                    return true; // can't check readyState - don't block forever on a driver that can't tell us
+                }
+                Object state = js.executeScript("return document.readyState;");
+                return "complete".equals(state);
+            });
+}
 ```
 
 Returns `true` once `document.readyState` reports `"complete"`. Returns
@@ -58,6 +75,27 @@ BrowserDriver.getCurrentDriver().manage().deleteAllCookies();
 public void navigateToDashboard() {
     Navigation.navigateToURL(dashboardUrl);
     WaitUtil.waitForPageLoadComplete(driver);
+}
+```
+
+```java
+public static boolean waitForCondition(final WebDriver driver, final String description,
+                                        final java.util.function.Function<WebDriver, Boolean> condition) {
+    Objects.requireNonNull(driver, "driver must not be null");
+    Objects.requireNonNull(description, "description must not be null");
+    Objects.requireNonNull(condition, "condition must not be null");
+    try {
+        return Boolean.TRUE.equals(new WebDriverWait(driver, WAIT_TIME)
+                .ignoring(NoSuchElementException.class, StaleElementReferenceException.class)
+                .pollingEvery(POLL_INTERVAL)
+                .until(condition));
+    } catch (TimeoutException e) {
+        System.out.printf("[WaitUtil] waitForCondition-timeout - %s%n", description);
+        return false;
+    } catch (Exception e) {
+        System.out.printf("[WaitUtil] waitForCondition-exception - %s: %s%n", description, e.getMessage());
+        return false;
+    }
 }
 ```
 
