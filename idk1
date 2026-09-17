@@ -462,3 +462,62 @@ public final class WaitUtil {
         }
     }
 }
+
+
+
+
+
+public static void findSomeoneWithNino(String nino) {
+    LOGGER.info("Finding someone with Nino");
+    waitForElementToBePresent(findSomeonePageElements.ninoField);
+
+    WaitUtil.waitForCondition(
+            BrowserDriver.getCurrentDriver(),
+            description: "Finding someone with Nino",
+            d -> !noResultsErrorStillShowing(nino));
+}
+
+/**
+ * Submits the NINO search and reports whether the "no results found"
+ * error is still being shown. Returns true to keep the wait polling
+ * (resubmitting) while the error persists; false once it clears,
+ * signalling the wait can stop.
+ */
+private static boolean noResultsErrorStillShowing(String nino) {
+    List<WebElement> ninoFields = BrowserDriver.getCurrentDriver()
+            .findElements(findSomeonePageElements.ninoFieldLocator);
+
+    if (ninoFields.isEmpty()) {
+        LOGGER.debug("NINO field not yet present; will retry.");
+        return true; // not ready — keep waiting
+    }
+
+    try {
+        WebElement ninoField = ninoFields.get(0);
+        ninoField.clear();
+        ninoField.sendKeys(nino);
+
+        List<WebElement> searchButtons = BrowserDriver.getCurrentDriver()
+                .findElements(findSomeonePageElements.searchButtonLocator);
+
+        if (searchButtons.isEmpty()) {
+            LOGGER.debug("Search button not yet present; will retry.");
+            return true; // not ready — keep waiting
+        }
+
+        searchButtons.get(0).click();
+    } catch (StaleElementReferenceException e) {
+        LOGGER.debug("Element went stale during submit; will retry.", e);
+        return true; // treat as "still showing/unresolved" — keep waiting
+    }
+
+    boolean noResultsShown = !findSomeonePageElements.noResultsFoundErrors.isEmpty();
+
+    if (noResultsShown) {
+        LOGGER.debug("No results found error still showing; retrying search.");
+    } else {
+        LOGGER.info("No results error cleared — search resolved.");
+    }
+
+    return noResultsShown;
+}
