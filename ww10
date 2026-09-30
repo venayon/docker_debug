@@ -1,0 +1,679 @@
+import org.openqa.selenium.ElementClickInterceptedException;
+import org.openqa.selenium.ElementNotInteractableException;
+import org.openqa.selenium.JavascriptExecutor;
+import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.StaleElementReferenceException;
+import org.openqa.selenium.TimeoutException;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.time.Duration;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
+
+/**
+ * Click and wait helpers for Selenium elements.
+ *
+ * <p>Most methods never throw for normal timing problems. They return
+ * {@code false} / {@link Optional#empty()} and print a log line instead, so
+ * you can just check the return value.
+ *
+ * <p>Two exceptions:
+ * <ul>
+ *   <li>{@link NullPointerException} / {@link IllegalArgumentException} for
+ *       bad input (null driver, null element). That is a bug in the test.</li>
+ *   <li>{@link ElementNotFoundException} when the element was never found for
+ *       the whole wait. That usually means a wrong locator.</li>
+ * </ul>
+ *
+ * <h2>Which method do I use?</h2>
+ * <ul>
+ *   <li>{@link #waitAndClick} - default way to click anything.</li>
+ *   <li>{@link #waitAndClickWithRefresh} - same, but refreshes the page and
+ *       tries again if the element does not become clickable.</li>
+ *   <li>{@link #safeClick} - plain click once the element is enabled.</li>
+ *   <li>{@link #waitForVisibleText} - wait for text, then read it.</li>
+ *   <li>{@link #waitForTextToContain} - wait until text contains a value.</li>
+ *   <li>{@link #waitForTitleToContain} - wait for the page title.</li>
+ *   <li>{@link #waitForUrlToContain} - wait for the URL.</li>
+ *   <li>{@link #waitForPageLoadComplete} - wait for the page to finish loading.</li>
+ *   <li>{@link #waitForCondition} - wait for any other driver-level condition.</li>
+ * </ul>
+ *
+ * <p>See WaitUtil-AwaitUtil-Guide.md for when to use {@link AwaitUtil} instead.
+ */
+public final class WaitUtil {
+
+    private static final Duration WAIT_TIME = Duration.ofSeconds(30);
+    // About 1 second, but never below 200ms so the wait can't hot-loop.
+    private static final Duration POLL_INTERVAL =
+            Duration.ofMillis(Math.max(WAIT_TIME.toMillis() / 30, 200));
+
+    // waitAndClickWithRefresh defaults: refresh every 10s, give up after 60s.
+    private static final Duration REFRESH_MAX_WAIT = Duration.ofSeconds(60);
+    private static final Duration REFRESH_POLL_INTERVAL = Duration.ofSeconds(10);
+
+    // How long a blocked click is retried before falling back to a JS click.
+    // Both are capped by the time left in the caller's wait.
+    // Intercepted = something covers the element (spinner/overlay).
+    private static final Duration INTERCEPT_RETRY_WINDOW = Duration.ofSeconds(10);
+    // Not interactable = element not shown yet (slow render).
+    private static final Duration NOT_INTERACTABLE_RETRY_WINDOW = Duration.ofSeconds(5);
+    private static final Duration CLICK_RETRY_POLL = Duration.ofMillis(250);
+
+    private WaitUtil() {
+        // Utility class - no instances.
+    }
+
+    /**
+     * Thrown when an element was never found during the whole wait (a
+     * {@link NoSuchElementException} kept happening). Unchecked on purpose:
+     * it usually means a wrong locator or the wrong page, so it is not
+     * turned into a {@code false} return.
+     */
+    public static final class ElementNotFoundException extends RuntimeException {
+        public ElementNotFoundException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /**
+     * True if {@code e} or any of its causes is a {@link NoSuchElementException}.
+     * WebDriverWait puts the last error it saw in the TimeoutException cause,
+     * so this tells "never found" apart from other timeouts.
+     */
+    private static boolean isGenuinelyNotFound(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof NoSuchElementException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Standard wait: 30s, polls every ~1s, retries on not-found and stale. */
+    private static WebDriverWait newElementWait(WebDriver driver) {
+        return newElementWait(driver, WAIT_TIME);
+    }
+
+    /** Same as above but with your own timeout. */
+    private static WebDriverWait newElementWait(WebDriver driver, Duration timeout) {
+        return new WebDriverWait(driver, timeout)
+                .ignoring(NoSuchElementException.class, StaleElementReferenceException.class)
+                .pollingEvery(POLL_INTERVAL);
+    }
+
+    // =================================================================
+    // Clicking
+    // =================================================================
+
+    /**
+     * Waits for the element to be enabled, then does a normal click.
+     *
+     * @return true if clicked; false if it never became clickable in time
+     */
+    public static boolean safeClick(final WebDriver driver, final WebElement element) {
+        return safeClick(driver, element, WAIT_TIME);
+    }
+
+    private static boolean safeClick(final WebDriver driver, final WebElement element, final Duration timeout) {
+        requireNonNull(driver, element);
+        try {
+            return Boolean.TRUE.equals(newElementWait(driver, timeout).until(d -> attemptClick(element)));
+        } catch (TimeoutException e) {
+            log("safeClick-timeout", element, e);
+            if (isGenuinelyNotFound(e)) {
+                throw new ElementNotFoundException("Element never present during safeClick wait", e);
+            }
+            return false;
+        } catch (Exception e) {
+            log("safeClick-exception", element, e);
+            return false;
+        }
+    }
+
+    private static Boolean attemptClick(WebElement element) {
+        if (!element.isEnabled()) {
+            return false; // false = keep polling
+        }
+        element.click();
+        return true;
+    }
+
+    /**
+     * Default click method. Waits until the element is ready, then clicks it.
+     *
+     * <p>Ready means: enabled, not {@code aria-disabled="true"}, and not
+     * {@code pointer-events: none}. It does not require the element to be
+     * visible, because some custom checkboxes/radios (e.g. GOV.UK) hide the
+     * real input but it is still clickable.
+     *
+     * <p>Click steps, in order:
+     * <ol>
+     *   <li>Normal click.</li>
+     *   <li>Element went stale: retry with {@link #safeClick}.</li>
+     *   <li>Click blocked by a spinner/overlay: keep retrying the normal
+     *       click (up to 10s) so the overlay can clear.</li>
+     *   <li>Element not interactable yet (still rendering): same, up to 5s.
+     *       Skipped if opacity is 0, because that element will never become
+     *       interactable.</li>
+     *   <li>Still blocked: JS click. Note this clicks through a spinner
+     *       that never goes away.</li>
+     * </ol>
+     *
+     * @return true if clicked; false if it never became ready or every step failed
+     */
+    public static boolean waitAndClick(final WebDriver driver, final WebElement element) {
+        return waitAndClick(driver, element, WAIT_TIME);
+    }
+
+    /** Same as above but with your own time limit. */
+    private static boolean waitAndClick(final WebDriver driver, final WebElement element, final Duration readyTimeout) {
+        requireNonNull(driver, element);
+        long startNanos = System.nanoTime();
+        boolean clicked;
+        try {
+            clicked = performClick(driver, element, readyTimeout);
+        } catch (ElementNotFoundException e) {
+            // Element was never found: let the caller see it.
+            throw e;
+        } catch (Exception e) {
+            log("waitAndClick-exception", element, e);
+            clicked = false;
+        } finally {
+            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+            System.out.printf("[WaitUtil] waitAndClick took %d ms%n", elapsedMs);
+        }
+        return clicked;
+    }
+
+    private static boolean performClick(final WebDriver driver, final WebElement element, final Duration timeout) {
+        final long startNanos = System.nanoTime();
+        try {
+            newElementWait(driver, timeout).until(d -> isGenuinelyReady(element));
+        } catch (TimeoutException e) {
+            log("waitAndClick-not-ready-timeout", element, e);
+            if (isGenuinelyNotFound(e)) {
+                throw new ElementNotFoundException("Element never present during waitAndClick wait", e);
+            }
+            return false;
+        }
+
+        try {
+            element.click();
+            return true;
+        } catch (StaleElementReferenceException e) {
+            log("waitAndClick-stale-retrying-via-safeClick", element, e);
+            return safeClick(driver, element, timeout);
+        } catch (ElementClickInterceptedException e) {
+            // Something covers the element (spinner/overlay). Wait for it to
+            // clear before forcing a JS click.
+            log("waitAndClick-intercepted-retrying-native", element, e);
+            Duration window = retryWindow(INTERCEPT_RETRY_WINDOW, timeout, startNanos);
+            if (retryNativeClick(driver, element, window)) {
+                return true;
+            }
+            log("waitAndClick-intercepted-falling-back-to-js", element, e);
+            return jsClick(driver, element);
+        } catch (ElementNotInteractableException e) {
+            // opacity 0 = intentionally hidden input, it will never become
+            // interactable, so skip the wait. Otherwise it may still be rendering.
+            if (!isOpacityHidden(element)) {
+                log("waitAndClick-not-interactable-retrying-native", element, e);
+                Duration window = retryWindow(NOT_INTERACTABLE_RETRY_WINDOW, timeout, startNanos);
+                if (retryNativeClick(driver, element, window)) {
+                    return true;
+                }
+            }
+            log("waitAndClick-not-interactable-falling-back-to-js", element, e);
+            return jsClick(driver, element);
+        }
+    }
+
+    /** Smaller of {@code cap} and the time left in {@code budget} (never negative). */
+    private static Duration retryWindow(Duration cap, Duration budget, long startNanos) {
+        Duration remaining = budget.minus(Duration.ofNanos(System.nanoTime() - startNanos));
+        if (remaining.isNegative()) {
+            return Duration.ZERO;
+        }
+        return remaining.compareTo(cap) < 0 ? remaining : cap;
+    }
+
+    /**
+     * Retries a normal click every 250ms for up to {@code window}, treating
+     * "blocked" errors as "not yet".
+     *
+     * @return true if a click went through; false if the window was empty or ran out
+     */
+    private static boolean retryNativeClick(WebDriver driver, WebElement element, Duration window) {
+        if (window.isZero() || window.isNegative()) {
+            return false;
+        }
+        try {
+            return Boolean.TRUE.equals(newElementWait(driver, window)
+                    .pollingEvery(CLICK_RETRY_POLL)
+                    .ignoring(ElementClickInterceptedException.class, ElementNotInteractableException.class)
+                    .until(d -> {
+                        element.click();
+                        return true;
+                    }));
+        } catch (TimeoutException e) {
+            log("waitAndClick-native-retry-timeout", element, e);
+            return false;
+        }
+    }
+
+    /** True if the element's opacity is 0 (intentionally hidden input). */
+    private static boolean isOpacityHidden(WebElement element) {
+        try {
+            return Double.parseDouble(element.getCssValue("opacity")) == 0.0;
+        } catch (Exception e) {
+            return false; // stale or unreadable: assume not hidden
+        }
+    }
+
+    /**
+     * Ready check used by {@link #waitAndClick}. {@code isEnabled()} only
+     * works for form controls (button, input, select, textarea...), so we
+     * also check {@code aria-disabled} and {@code pointer-events} to catch
+     * disabled divs, spans and links.
+     *
+     * <p>It does not check {@code isDisplayed()} on purpose (see
+     * {@link #waitAndClick}). A truly hidden or covered element is handled by
+     * the click attempt itself.
+     */
+    private static boolean isGenuinelyReady(WebElement element) {
+        try {
+            if (!element.isEnabled()) {
+                return false;
+            }
+            if ("true".equalsIgnoreCase(element.getAttribute("aria-disabled"))) {
+                return false;
+            }
+            if ("none".equalsIgnoreCase(element.getCssValue("pointer-events"))) {
+                return false;
+            }
+            return true;
+        } catch (StaleElementReferenceException | NoSuchElementException e) {
+            return false; // let the wait try again
+        }
+    }
+
+    // =================================================================
+    // Click with browser refresh + polling
+    // =================================================================
+
+    /** {@link #waitAndClickWithRefresh(WebDriver, WebElement, Duration, Duration)} with defaults (60s max, refresh every 10s). */
+    public static boolean waitAndClickWithRefresh(final WebDriver driver, final WebElement element) {
+        return waitAndClickWithRefresh(driver, element, REFRESH_MAX_WAIT, REFRESH_POLL_INTERVAL);
+    }
+
+    /**
+     * For pages where a button only appears or enables after a reload.
+     * Tries {@link #waitAndClick} for up to {@code pollInterval}; if it could
+     * not click, refreshes the page and tries again, until {@code maxWait}
+     * runs out. No refresh after the last attempt.
+     *
+     * <pre>{@code
+     * assertThat(WaitUtil.waitAndClickWithRefresh(driver, submitButton, Duration.ofSeconds(90), Duration.ofSeconds(15)))
+     *         .as("Submit clickable (after refresh if needed)").isTrue();
+     * }</pre>
+     *
+     * <p>A refresh makes old element references stale, so use lazy Page
+     * Factory {@code @FindBy} fields, not a plain {@code driver.findElement(...)} result.
+     *
+     * @param maxWait      total time limit for all attempts (must be positive)
+     * @param pollInterval time to wait for each attempt before refreshing (must be positive)
+     * @return true once clicked; false if never clickable within {@code maxWait}
+     * @throws ElementNotFoundException if the last attempt still could not find the element
+     */
+    public static boolean waitAndClickWithRefresh(final WebDriver driver, final WebElement element,
+                                                  final Duration maxWait, final Duration pollInterval) {
+        requireNonNull(driver, element);
+        Objects.requireNonNull(maxWait, "maxWait must not be null");
+        Objects.requireNonNull(pollInterval, "pollInterval must not be null");
+        if (maxWait.isZero() || maxWait.isNegative() || pollInterval.isZero() || pollInterval.isNegative()) {
+            throw new IllegalArgumentException("maxWait and pollInterval must be positive");
+        }
+
+        final long deadline = System.nanoTime() + maxWait.toNanos();
+        while (System.nanoTime() < deadline) {
+            long remaining = deadline - System.nanoTime();
+            boolean lastAttempt = remaining <= pollInterval.toNanos();
+            try {
+                if (waitAndClick(driver, element, Duration.ofNanos(Math.min(remaining, pollInterval.toNanos())))) {
+                    return true;
+                }
+            } catch (ElementNotFoundException e) {
+                if (lastAttempt) {
+                    throw e; // may appear after a refresh, but not after the last attempt
+                }
+            }
+            if (!lastAttempt) {
+                driver.navigate().refresh();
+                waitForPageLoadComplete(driver);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Runs {@code action}. If it fails, refreshes the page and runs it again.
+     * Use it when {@code action} waits for an element (for example
+     * {@code () -> waitForVisibleText(driver, el).isPresent()}).
+     *
+     * <p>Notes:
+     * <ul>
+     *   <li>{@code maxAttempts} counts the first try too, and is at least 2.</li>
+     *   <li>If the page does not finish loading after a refresh, the action still runs.</li>
+     *   <li>If the element was not found on the last attempt,
+     *       {@link ElementNotFoundException} is thrown (same as {@link #waitAndClickWithRefresh}).</li>
+     *   <li>A refresh clears form data, so do not use an action that submits or changes data.</li>
+     * </ul>
+     *
+     * @return true if the action succeeded; false if every attempt failed
+     */
+    private static boolean retryWithRefresh(
+            final WebDriver driver,
+            final int maxAttempts,
+            final BooleanSupplier action) {
+        Objects.requireNonNull(driver, "driver must not be null");
+        Objects.requireNonNull(action, "action must not be null");
+
+        final int attempts = Math.max(maxAttempts, 2);
+        ElementNotFoundException lastNotFound = null;
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            lastNotFound = null;
+            try {
+                if (attempt > 1) {
+                    driver.navigate().refresh();
+                    if (!waitForPageLoadComplete(driver)) {
+                        System.out.printf("[WaitUtil] attempt %d/%d: page not fully loaded, trying anyway%n",
+                                attempt, attempts);
+                    }
+                }
+                if (action.getAsBoolean()) {
+                    return true;
+                }
+            } catch (ElementNotFoundException e) {
+                lastNotFound = e;
+                System.out.printf("[WaitUtil] attempt %d/%d: element not found%n", attempt, attempts);
+            } catch (TimeoutException | StaleElementReferenceException | NoSuchElementException e) {
+                System.out.printf("[WaitUtil] attempt %d/%d failed: %s%n",
+                        attempt, attempts, e.getClass().getSimpleName());
+            }
+        }
+
+        if (lastNotFound != null) {
+            throw lastNotFound;
+        }
+        return false;
+    }
+
+    // =================================================================
+    // Reading element text
+    // =================================================================
+
+    /**
+     * Waits for the element to be visible, then returns its trimmed text.
+     * Use it for read-only elements (banners, toasts, labels).
+     *
+     * @return the text, or {@link Optional#empty()} if it never became visible,
+     *         stayed blank, or an error happened
+     */
+    public static Optional<String> waitForVisibleText(final WebDriver driver, final WebElement element) {
+        requireNonNull(driver, element);
+        try {
+            String text = newElementWait(driver).until(d -> nonBlankVisibleText(element));
+            return Optional.ofNullable(text);
+        } catch (TimeoutException e) {
+            log("waitForVisibleText-timeout", element, e);
+            if (isGenuinelyNotFound(e)) {
+                throw new ElementNotFoundException("Element never present during waitForVisibleText wait", e);
+            }
+            return Optional.empty();
+        } catch (Exception e) {
+            log("waitForVisibleText-exception", element, e);
+            return Optional.empty();
+        }
+    }
+
+    /** Trimmed text if the element is visible and not blank, otherwise null (keeps the wait polling). */
+    private static String nonBlankVisibleText(WebElement element) {
+        if (!element.isDisplayed()) {
+            return null;
+        }
+        String text = element.getText();
+        if (text == null) {
+            return null;
+        }
+        text = text.trim();
+        return text.isEmpty() ? null : text;
+    }
+
+    /**
+     * Waits for the element's visible text to contain {@code expectedText}
+     * (ignores upper/lower case). Good for checking a banner or toast message.
+     *
+     * @return true if the text appeared in time; false otherwise
+     */
+    public static boolean waitForTextToContain(final WebDriver driver, final WebElement element,
+                                                final String expectedText) {
+        requireNonNull(driver, element);
+        Objects.requireNonNull(expectedText, "expectedText must not be null");
+        try {
+            return Boolean.TRUE.equals(newElementWait(driver).until(d -> textContains(element, expectedText)));
+        } catch (TimeoutException e) {
+            log("waitForTextToContain-timeout", element, e);
+            if (isGenuinelyNotFound(e)) {
+                throw new ElementNotFoundException("Element never present during waitForTextToContain wait", e);
+            }
+            return false;
+        } catch (Exception e) {
+            log("waitForTextToContain-exception", element, e);
+            return false;
+        }
+    }
+
+    private static boolean textContains(WebElement element, String expectedText) {
+        String actual = nonBlankVisibleText(element);
+        return actual != null && actual.toLowerCase(Locale.ROOT).contains(expectedText.toLowerCase(Locale.ROOT));
+    }
+
+    // =================================================================
+    // Driver-level conditions (not tied to one element)
+    // =================================================================
+
+    /**
+     * Waits for any driver-level condition (page title, URL, number of
+     * windows, alert present...). Use this when you don't have a
+     * {@link WebElement}.
+     *
+     * @param description short label for the log, e.g. "title contains 'Dashboard'"
+     * @param condition   checked on every poll; keep it quick and free of side effects
+     * @return true if the condition became true in time; false on timeout or error
+     */
+    public static boolean waitForCondition(final WebDriver driver, final String description,
+                                            final Function<WebDriver, Boolean> condition) {
+        Objects.requireNonNull(driver, "driver must not be null");
+        Objects.requireNonNull(description, "description must not be null");
+        Objects.requireNonNull(condition, "condition must not be null");
+        try {
+            return Boolean.TRUE.equals(newElementWait(driver).until(condition));
+        } catch (TimeoutException e) {
+            System.out.printf("[WaitUtil] waitForCondition-timeout - %s%n", description);
+            return false;
+        } catch (Exception e) {
+            System.out.printf("[WaitUtil] waitForCondition-exception - %s: %s%n", description, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Waits for the page title to contain {@code expectedTitle} (ignores
+     * upper/lower case). Useful after a navigation or redirect.
+     *
+     * <pre>{@code
+     * assertThat(WaitUtil.waitForTitleToContain(driver, "Dashboard")).isTrue();
+     * }</pre>
+     *
+     * @return true if the title matched in time; false otherwise
+     */
+    public static boolean waitForTitleToContain(final WebDriver driver, final String expectedTitle) {
+        Objects.requireNonNull(expectedTitle, "expectedTitle must not be null");
+        String needle = expectedTitle.toLowerCase(Locale.ROOT);
+        return waitForCondition(driver, "title contains '" + expectedTitle + "'",
+                d -> {
+                    String title = d.getTitle();
+                    return title != null && title.toLowerCase(Locale.ROOT).contains(needle);
+                });
+    }
+
+    /**
+     * Waits for the URL to contain {@code expectedFragment} (upper/lower case
+     * matters). Useful after a redirect or route change.
+     *
+     * @return true if the URL matched in time; false otherwise
+     */
+    public static boolean waitForUrlToContain(final WebDriver driver, final String expectedFragment) {
+        Objects.requireNonNull(expectedFragment, "expectedFragment must not be null");
+        return waitForCondition(driver, "URL contains '" + expectedFragment + "'",
+                d -> {
+                    String url = d.getCurrentUrl();
+                    return url != null && url.contains(expectedFragment);
+                });
+    }
+
+    /**
+     * Waits for the page to finish loading ({@code document.readyState} is
+     * "complete"). Use it instead of a fixed {@code sleep(...)} after
+     * {@code driver.get()} or {@code navigate()}.
+     *
+     * <pre>{@code
+     * Navigation.navigateToURL(startPageURL);
+     * WaitUtil.waitForPageLoadComplete(driver);
+     * }</pre>
+     *
+     * @return true if the page finished loading in time; false on timeout or error
+     */
+    public static boolean waitForPageLoadComplete(final WebDriver driver) {
+        return waitForCondition(driver, "page load complete (document.readyState)",
+                d -> {
+                    if (!(d instanceof JavascriptExecutor js)) {
+                        return true; // can't check, so don't block
+                    }
+                    Object state = js.executeScript("return document.readyState;");
+                    return "complete".equals(state);
+                });
+    }
+
+    // =================================================================
+    // Internal: JavaScript click (last-resort fallback for waitAndClick)
+    // =================================================================
+
+    /**
+     * Clicks with JavaScript. Tries a plain JS click first. If that fails,
+     * sets opacity to 1, clicks, and always puts the old opacity back.
+     */
+    private static boolean jsClick(final WebDriver driver, final WebElement element) {
+        if (!(driver instanceof JavascriptExecutor javascriptExecutor)) {
+            log("jsClick-unsupported-driver", element, null);
+            return false;
+        }
+
+        if (tryDirectJsClick(javascriptExecutor, element)) {
+            return true;
+        }
+
+        return tryOpacityForcedClick(javascriptExecutor, element);
+    }
+
+    private static boolean tryDirectJsClick(JavascriptExecutor javascriptExecutor, WebElement element) {
+        try {
+            // "return true" is needed, click() itself returns nothing.
+            Object result = javascriptExecutor.executeScript("arguments[0].click(); return true;", element);
+            return Boolean.TRUE.equals(result);
+        } catch (Exception e) {
+            log("jsClick-direct-failed", element, e);
+            return false;
+        }
+    }
+
+    private static boolean tryOpacityForcedClick(JavascriptExecutor javascriptExecutor, WebElement element) {
+        String originalOpacity = null;
+        try {
+            originalOpacity = element.getCssValue("opacity");
+            javascriptExecutor.executeScript("arguments[0].style.opacity='1';", element);
+            sleepBriefly(50);
+            element.click();
+            return true;
+        } catch (Exception e) {
+            log("jsClick-opacity-fallback-failed", element, e);
+            return false;
+        } finally {
+            restoreOpacity(javascriptExecutor, element, originalOpacity);
+        }
+    }
+
+    private static void restoreOpacity(JavascriptExecutor javascriptExecutor, WebElement element, String originalOpacity) {
+        if (originalOpacity == null || originalOpacity.isBlank()) {
+            return; // nothing to restore
+        }
+        try {
+            javascriptExecutor.executeScript("arguments[0].style.opacity='" + originalOpacity + "';", element);
+        } catch (Exception e) {
+            log("jsClick-opacity-restore-failed", element, e);
+        }
+    }
+
+    private static void sleepBriefly(long millis) throws InterruptedException {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); // keep the interrupt flag
+            throw e;
+        }
+    }
+
+    // =================================================================
+    // Internal: shared helpers (null checks, logging)
+    // =================================================================
+
+    private static void requireNonNull(WebDriver driver, WebElement element) {
+        Objects.requireNonNull(driver, "driver must not be null");
+        Objects.requireNonNull(element, "element must not be null");
+    }
+
+    /** Prints element details for debugging. Never throws, so it can't hide the real error. */
+    private static void log(String msg, WebElement element, Exception e) {
+        try {
+            System.out.printf(
+                    "[WaitUtil] %s - Displayed: %s, Enabled: %s, Location: %s, TagName: %s, Text: %s, Opacity: %s, Exception: %s%n",
+                    msg,
+                    safely(element::isDisplayed),
+                    safely(element::isEnabled),
+                    safely(element::getLocation),
+                    safely(element::getTagName),
+                    safely(element::getText),
+                    safely(() -> element.getCssValue("opacity")),
+                    e == null ? "none" : e.getClass().getSimpleName() + ": " + e.getMessage());
+        } catch (Exception loggingFailure) {
+            System.out.printf("[WaitUtil] %s - (unable to capture element diagnostics: %s)%n",
+                    msg, loggingFailure.getMessage());
+        }
+    }
+
+    private static Object safely(Callable<?> supplier) {
+        try {
+            return supplier.call();
+        } catch (Exception e) {
+            return "n/a";
+        }
+    }
+}
