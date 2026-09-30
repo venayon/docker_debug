@@ -1,0 +1,119 @@
+import java.util.Objects;
+import java.util.function.BooleanSupplier;
+
+private static boolean retryWithRefresh(
+        final WebDriver driver,
+        final int maxAttempts,
+        final BooleanSupplier action) {
+
+    Objects.requireNonNull(driver, "driver must not be null");
+    Objects.requireNonNull(action, "action must not be null");
+
+    final int attempts = Math.max(maxAttempts, 2);
+
+    for (int attempt = 1; attempt <= attempts; attempt++) {
+
+        log(String.format(
+                "retryWithRefresh :: attempt [%d of %d]",
+                attempt,
+                attempts));
+
+        // Refresh only before retries, not before the initial attempt.
+        if (attempt > 1) {
+
+            log(String.format(
+                    "retryWithRefresh :: refreshing page before attempt [%d]",
+                    attempt));
+
+            try {
+                driver.navigate().refresh();
+
+                if (!waitForPageLoadComplete(driver)) {
+                    log(String.format(
+                            "retryWithRefresh :: page load not complete "
+                                    + "after refresh for attempt [%d]",
+                            attempt));
+
+                    continue;
+                }
+
+            } catch (TimeoutException e) {
+                log(String.format(
+                        "retryWithRefresh :: refresh timed out "
+                                + "before attempt [%d]: %s",
+                        attempt,
+                        e.getMessage()));
+
+                continue;
+            }
+        }
+
+        try {
+            if (action.getAsBoolean()) {
+                log(String.format(
+                        "retryWithRefresh :: action succeeded "
+                                + "on attempt [%d]",
+                        attempt));
+
+                return true;
+            }
+
+            log(String.format(
+                    "retryWithRefresh :: action returned false "
+                            + "on attempt [%d]",
+                    attempt));
+
+        } catch (StaleElementReferenceException
+                 | TimeoutException
+                 | ElementClickInterceptedException e) {
+
+            log(String.format(
+                    "retryWithRefresh :: action failed "
+                            + "on attempt [%d]: %s",
+                    attempt,
+                    e.getMessage()));
+        }
+    }
+
+    log(String.format(
+            "retryWithRefresh :: action failed after [%d] attempts",
+            attempts));
+
+    return false;
+}
+
+
+
+
+private static boolean retryWithRefresh(
+        final WebDriver driver,
+        final int maxRetries,
+        final BooleanSupplier action) {
+
+    int attempts = Math.max(maxRetries, 1) + 1;
+
+    for (int attempt = 1; attempt <= attempts; attempt++) {
+
+        try {
+            if (attempt > 1) {
+                driver.navigate().refresh();
+
+                if (!waitForPageLoadComplete(driver)) {
+                    continue;
+                }
+            }
+
+            if (action.getAsBoolean()) {
+                return true;
+            }
+
+        } catch (TimeoutException
+                 | StaleElementReferenceException
+                 | ElementClickInterceptedException e) {
+
+            log("Attempt " + attempt + " failed: " + e.getMessage());
+        }
+    }
+
+    return false;
+}
