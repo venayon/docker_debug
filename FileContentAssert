@@ -1,0 +1,588 @@
+package acceptance.support;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * One class for all "generated file" assertions (pipe-delimited, no header, positional columns).
+ *
+ * <pre>
+ * FileContentAssert.of(expectedLines, actualLines)
+ *         .numericColumns(3)                                   // 10.0 equals 10.00 in column 3
+ *         .positionData(FileContentAssert.at(null, null, "ABC", "100.00"))   // index = column, null = ignore
+ *         .validate();                                         // runs all checks, reports ALL failures at once
+ *
+ * FileContentAssert.of(expected, actual).validate(Check.SIZE, Check.FOOTER);   // only some checks
+ * </pre>
+ */
+public final class FileContentAssert {
+
+    /** The checks this class can run. */
+    public enum Check {
+        /** Same number of (non-blank) lines. */
+        SIZE,
+        /** Last line: fixed footer columns match, and its record count equals the real number of body lines. */
+        FOOTER,
+        /** Body lines (all except footer) are identical, ignoring order, duplicates respected. */
+        BODY_ANY_ORDER,
+        /** Positional data supplied through positionData(..) / positionDataOnAllLines(..). */
+        POSITION_DATA
+    }
+
+    /** Fixed footer layout: 0-based column index. Change these to match your real footer. */
+    public enum FooterColumn {
+        RECORD_TYPE(0, false),
+        RECORD_COUNT(1, true),
+        TOTAL_AMOUNT(2, true);
+
+        private final int index;
+        private final boolean numeric;
+
+        FooterColumn(int index, boolean numeric) {
+            this.index = index;
+            this.numeric = numeric;
+        }
+    }
+
+    private enum Mode { ANY_LINE, ALL_LINES }
+
+    private record PositionRule(List<String> values, Mode mode) { }
+
+    private static final String DELIMITER = "\\|";
+
+    private final List<List<String>> expected;
+    private final List<List<String>> actual;
+    private final Set<Integer> numericColumns = new HashSet<>();
+    private final List<PositionRule> positionRules = new ArrayList<>();
+    private boolean hasFooter = true;
+
+    private FileContentAssert(List<String> expectedLines, List<String> actualLines) {
+        this.expected = normalise(expectedLines);
+        this.actual = normalise(actualLines);
+    }
+
+    public static FileContentAssert of(List<String> expectedLines, List<String> actualLines) {
+        return new FileContentAssert(expectedLines, actualLines);
+    }
+
+    /** Readable way to build a position list: index = column, null = "don't care". */
+    public static List<String> at(String... valuesByPosition) {
+        return Arrays.asList(valuesByPosition);
+    }
+
+    // ---------- configuration (all optional) ----------
+
+    public FileContentAssert withoutFooter() {
+        this.hasFooter = false;
+        return this;
+    }
+
+    /** Body columns compared as numbers (so 10.0 == 10.00). 0-based. */
+    public FileContentAssert numericColumns(int... columns) {
+        for (int c : columns) {
+            numericColumns.add(c);
+        }
+        return this;
+    }
+
+    /** At least one body line must have these values at these positions. */
+    public FileContentAssert positionData(List<String> valuesByPosition) {
+        positionRules.add(new PositionRule(valuesByPosition, Mode.ANY_LINE));
+        return this;
+    }
+
+    /** Every body line must have these values at these positions. */
+    public FileContentAssert positionDataOnAllLines(List<String> valuesByPosition) {
+        positionRules.add(new PositionRule(valuesByPosition, Mode.ALL_LINES));
+        return this;
+    }
+
+    // ---------- validation ----------
+
+    /** Runs the given checks (or all applicable checks when none are given) and fails once with every problem found. */
+    public void validate(Check... checks) {
+        EnumSet<Check> toRun = checks.length == 0
+                ? EnumSet.of(Check.SIZE, Check.FOOTER, Check.BODY_ANY_ORDER)
+                : EnumSet.copyOf(Arrays.asList(checks));
+        if (checks.length == 0 && !positionRules.isEmpty()) {
+            toRun.add(Check.POSITION_DATA);
+        }
+
+        List<String> errors = new ArrayList<>();
+        if (toRun.contains(Check.SIZE)) {
+            checkSize(errors);
+        }
+        if (toRun.contains(Check.FOOTER) && hasFooter) {
+            checkFooter(errors);
+        }
+        if (toRun.contains(Check.BODY_ANY_ORDER)) {
+            checkBody(errors);
+        }
+        if (toRun.contains(Check.POSITION_DATA)) {
+            checkPositionData(errors);
+        }
+        if (!errors.isEmpty()) {
+            throw new AssertionError("File content validation failed:\n - " + String.join("\n - ", errors));
+        }
+    }
+
+    private void checkSize(List<String> errors) {
+        if (expected.size() != actual.size()) {
+            errors.add("SIZE: expected " + expected.size() + " lines but file has " + actual.size());
+        }
+    }
+
+    private void checkFooter(List<String> errors) {
+        if (expected.isEmpty() || actual.isEmpty()) {
+            errors.add("FOOTER: expected or actual file has no lines");
+            return;
+        }
+        List<String> expFooter = expected.get(expected.size() - 1);
+        List<String> actFooter = actual.get(actual.size() - 1);
+        for (FooterColumn col : FooterColumn.values()) {
+            String e = cell(expFooter, col.index);
+            String a = cell(actFooter, col.index);
+            if (!same(e, a, col.numeric)) {
+                errors.add("FOOTER " + col + " (position " + col.index + "): expected '" + e + "' but was '" + a + "'");
+            }
+        }
+        String declared = cell(actFooter, FooterColumn.RECORD_COUNT.index);
+        int bodySize = actual.size() - 1;
+        if (!same(declared, String.valueOf(bodySize), true)) {
+            errors.add("FOOTER RECORD_COUNT says " + declared + " but file body has " + bodySize + " lines");
+        }
+    }
+
+    private void checkBody(List<String> errors) {
+        Map<String, Integer> remaining = new HashMap<>();
+        for (List<String> row : body(expected)) {
+            remaining.merge(key(row), 1, Integer::sum);
+        }
+        List<String> unexpected = new ArrayList<>();
+        for (List<String> row : body(actual)) {
+            String k = key(row);
+            Integer left = remaining.get(k);
+            if (left == null || left == 0) {
+                unexpected.add(String.join("|", row));
+            } else {
+                remaining.put(k, left - 1);
+            }
+        }
+        remaining.forEach((k, n) -> {
+            for (int i = 0; i < n; i++) {
+                errors.add("BODY missing line: " + k);
+            }
+        });
+        unexpected.forEach(line -> errors.add("BODY unexpected line: " + line));
+    }
+
+    private void checkPositionData(List<String> errors) {
+        List<List<String>> rows = body(actual);
+        for (PositionRule rule : positionRules) {
+            if (rule.mode() == Mode.ANY_LINE) {
+                if (rows.stream().noneMatch(r -> matches(r, rule.values()))) {
+                    errors.add("POSITION_DATA no line matches " + describe(rule.values()));
+                }
+            } else {
+                rows.stream().filter(r -> !matches(r, rule.values())).limit(5)
+                        .forEach(r -> errors.add("POSITION_DATA line does not match " + describe(rule.values())
+                                + ": " + String.join("|", r)));
+            }
+        }
+    }
+
+    // ---------- helpers ----------
+
+    private List<List<String>> body(List<List<String>> rows) {
+        return hasFooter && !rows.isEmpty() ? rows.subList(0, rows.size() - 1) : rows;
+    }
+
+    private boolean matches(List<String> row, List<String> pattern) {
+        for (int i = 0; i < pattern.size(); i++) {
+            String p = pattern.get(i);
+            if (p != null && !same(cell(row, i), p.strip(), numericColumns.contains(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Canonical key so numeric columns compare by value, others as trimmed text. */
+    private String key(List<String> row) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < row.size(); i++) {
+            sb.append(numericColumns.contains(i) ? canonical(row.get(i)) : row.get(i)).append('|');
+        }
+        return sb.toString();
+    }
+
+    private static boolean same(String a, String b, boolean numeric) {
+        return numeric ? canonical(a).equals(canonical(b)) : a.equals(b);
+    }
+
+    private static String canonical(String value) {
+        try {
+            BigDecimal d = new BigDecimal(value);
+            return d.signum() == 0 ? "0" : d.stripTrailingZeros().toPlainString();
+        } catch (NumberFormatException e) {
+            return value;
+        }
+    }
+
+    private static String cell(List<String> row, int index) {
+        return index < row.size() ? row.get(index) : "";
+    }
+
+    private static String describe(List<String> positions) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < positions.size(); i++) {
+            if (positions.get(i) != null) {
+                sb.append("[").append(i).append("]='").append(positions.get(i)).append("' ");
+            }
+        }
+        return sb.toString().trim();
+    }
+
+    /** Removes BOM / NBSP / CR / padding, drops blank lines, splits on | keeping trailing empty fields. */
+    private static List<List<String>> normalise(List<String> lines) {
+        List<List<String>> out = new ArrayList<>();
+        for (String raw : lines) {
+            String s = raw.replace("﻿", "").replace(' ', ' ').strip();
+            if (s.isEmpty()) {
+                continue;
+            }
+            out.add(Arrays.stream(s.split(DELIMITER, -1)).map(String::strip).toList());
+        }
+        return out;
+    }
+}
+
+////////////////////////////////////////
+package acceptance.support;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * One class for all "generated file" assertions (pipe-delimited, no header, positional columns).
+ *
+ * <pre>
+ * FileContentAssert.of(expectedLines, actualLines)
+ *         .numericColumns(3)                                   // 10.0 equals 10.00 in column 3
+ *         .type("CLN")                                         // only CLN records (first column)
+ *         .id("ABC123")                                        // only id at position 3 (CLN or CMP only)
+ *         .positionData(FileContentAssert.at(null, null, "ABC", "100.00"))   // index = column, null = ignore
+ *         .validate();                                         // runs all checks, reports ALL failures at once
+ *
+ * FileContentAssert.of(expected, actual).validate(Check.SIZE, Check.FOOTER);   // only some checks
+ * </pre>
+ */
+public final class FileContentAssert {
+
+    /** The checks this class can run. */
+    public enum Check {
+        /** Same number of (non-blank) lines. */
+        SIZE,
+        /** Last line: fixed footer columns match, and its record count equals the real number of body lines. */
+        FOOTER,
+        /** Body lines (all except footer) are identical, ignoring order, duplicates respected. */
+        BODY_ANY_ORDER,
+        /** Positional data supplied through positionData(..) / positionDataOnAllLines(..). */
+        POSITION_DATA
+    }
+
+    /** Fixed footer layout: 0-based column index. Change these to match your real footer. */
+    public enum FooterColumn {
+        RECORD_TYPE(0, false),
+        RECORD_COUNT(1, true),
+        TOTAL_AMOUNT(2, true);
+
+        private final int index;
+        private final boolean numeric;
+
+        FooterColumn(int index, boolean numeric) {
+            this.index = index;
+            this.numeric = numeric;
+        }
+    }
+
+    private enum Mode { ANY_LINE, ALL_LINES }
+
+    private record PositionRule(List<String> values, Mode mode) { }
+
+    private static final String DELIMITER = "\\|";
+
+    private final List<List<String>> expected;
+    private final List<List<String>> actual;
+    private final Set<Integer> numericColumns = new HashSet<>();
+    private final List<PositionRule> positionRules = new ArrayList<>();
+    private boolean hasFooter = true;
+    private String type;
+    private String id;
+
+    /** Record type is always the first column. */
+    private static final int TYPE_POSITION = 0;
+    /** Record id position, only defined for these record types. */
+    private static final int ID_POSITION = 3;
+    private static final Set<String> TYPES_WITH_ID = Set.of("CLN", "CMP");
+
+    private FileContentAssert(List<String> expectedLines, List<String> actualLines) {
+        this.expected = normalise(expectedLines);
+        this.actual = normalise(actualLines);
+    }
+
+    public static FileContentAssert of(List<String> expectedLines, List<String> actualLines) {
+        return new FileContentAssert(expectedLines, actualLines);
+    }
+
+    /** Readable way to build a position list: index = column, null = "don't care". */
+    public static List<String> at(String... valuesByPosition) {
+        return Arrays.asList(valuesByPosition);
+    }
+
+    // ---------- configuration (all optional) ----------
+
+    public FileContentAssert withoutFooter() {
+        this.hasFooter = false;
+        return this;
+    }
+
+    /**
+     * Narrow SIZE, BODY_ANY_ORDER and POSITION_DATA to records of this type (first column),
+     * in both expected and actual. The footer check is unaffected and still looks at the whole file.
+     */
+    public FileContentAssert type(String recordType) {
+        this.type = recordType.strip();
+        return this;
+    }
+
+    /**
+     * Narrow further to the record with this id (position 3). Only valid together with
+     * type CLN or CMP; checked when validate() runs, so call order does not matter.
+     */
+    public FileContentAssert id(String recordId) {
+        this.id = recordId.strip();
+        return this;
+    }
+
+    /** Body columns compared as numbers (so 10.0 == 10.00). 0-based. */
+    public FileContentAssert numericColumns(int... columns) {
+        for (int c : columns) {
+            numericColumns.add(c);
+        }
+        return this;
+    }
+
+    /** At least one body line must have these values at these positions. */
+    public FileContentAssert positionData(List<String> valuesByPosition) {
+        positionRules.add(new PositionRule(valuesByPosition, Mode.ANY_LINE));
+        return this;
+    }
+
+    /** Every body line must have these values at these positions. */
+    public FileContentAssert positionDataOnAllLines(List<String> valuesByPosition) {
+        positionRules.add(new PositionRule(valuesByPosition, Mode.ALL_LINES));
+        return this;
+    }
+
+    // ---------- validation ----------
+
+    /** Runs the given checks (or all applicable checks when none are given) and fails once with every problem found. */
+    public void validate(Check... checks) {
+        EnumSet<Check> toRun = checks.length == 0
+                ? EnumSet.of(Check.SIZE, Check.FOOTER, Check.BODY_ANY_ORDER)
+                : EnumSet.copyOf(Arrays.asList(checks));
+        if (checks.length == 0 && !positionRules.isEmpty()) {
+            toRun.add(Check.POSITION_DATA);
+        }
+
+        if (id != null && (type == null || !TYPES_WITH_ID.contains(type))) {
+            throw new IllegalStateException("id(..) needs type(..) to be one of " + TYPES_WITH_ID + " but type is " + type);
+        }
+
+        List<String> errors = new ArrayList<>();
+        if (type != null && scoped(actual).isEmpty()) {
+            errors.add("SCOPE: no " + scopeName() + " records found in the file");
+        }
+        if (toRun.contains(Check.SIZE)) {
+            checkSize(errors);
+        }
+        if (toRun.contains(Check.FOOTER) && hasFooter) {
+            checkFooter(errors);
+        }
+        if (toRun.contains(Check.BODY_ANY_ORDER)) {
+            checkBody(errors);
+        }
+        if (toRun.contains(Check.POSITION_DATA)) {
+            checkPositionData(errors);
+        }
+        if (!errors.isEmpty()) {
+            throw new AssertionError("File content validation failed:\n - " + String.join("\n - ", errors));
+        }
+    }
+
+    private void checkSize(List<String> errors) {
+        int exp = type == null ? expected.size() : scoped(expected).size();
+        int act = type == null ? actual.size() : scoped(actual).size();
+        if (exp != act) {
+            String what = type == null ? "lines" : scopeName() + " records";
+            errors.add("SIZE: expected " + exp + " " + what + " but file has " + act);
+        }
+    }
+
+    private void checkFooter(List<String> errors) {
+        if (expected.isEmpty() || actual.isEmpty()) {
+            errors.add("FOOTER: expected or actual file has no lines");
+            return;
+        }
+        List<String> expFooter = expected.get(expected.size() - 1);
+        List<String> actFooter = actual.get(actual.size() - 1);
+        for (FooterColumn col : FooterColumn.values()) {
+            String e = cell(expFooter, col.index);
+            String a = cell(actFooter, col.index);
+            if (!same(e, a, col.numeric)) {
+                errors.add("FOOTER " + col + " (position " + col.index + "): expected '" + e + "' but was '" + a + "'");
+            }
+        }
+        String declared = cell(actFooter, FooterColumn.RECORD_COUNT.index);
+        int bodySize = actual.size() - 1;
+        if (!same(declared, String.valueOf(bodySize), true)) {
+            errors.add("FOOTER RECORD_COUNT says " + declared + " but file body has " + bodySize + " lines");
+        }
+    }
+
+    private void checkBody(List<String> errors) {
+        Map<String, Integer> remaining = new HashMap<>();
+        for (List<String> row : scoped(expected)) {
+            remaining.merge(key(row), 1, Integer::sum);
+        }
+        List<String> unexpected = new ArrayList<>();
+        for (List<String> row : scoped(actual)) {
+            String k = key(row);
+            Integer left = remaining.get(k);
+            if (left == null || left == 0) {
+                unexpected.add(String.join("|", row));
+            } else {
+                remaining.put(k, left - 1);
+            }
+        }
+        remaining.forEach((k, n) -> {
+            for (int i = 0; i < n; i++) {
+                errors.add("BODY missing line: " + k);
+            }
+        });
+        unexpected.forEach(line -> errors.add("BODY unexpected line: " + line));
+    }
+
+    private void checkPositionData(List<String> errors) {
+        List<List<String>> rows = scoped(actual);
+        for (PositionRule rule : positionRules) {
+            if (rule.mode() == Mode.ANY_LINE) {
+                if (rows.stream().noneMatch(r -> matches(r, rule.values()))) {
+                    errors.add("POSITION_DATA no line matches " + describe(rule.values()));
+                }
+            } else {
+                rows.stream().filter(r -> !matches(r, rule.values())).limit(5)
+                        .forEach(r -> errors.add("POSITION_DATA line does not match " + describe(rule.values())
+                                + ": " + String.join("|", r)));
+            }
+        }
+    }
+
+    // ---------- helpers ----------
+
+    private List<List<String>> body(List<List<String>> rows) {
+        return hasFooter && !rows.isEmpty() ? rows.subList(0, rows.size() - 1) : rows;
+    }
+
+    /** Body rows narrowed by type() and id(); the whole body when neither is set. */
+    private List<List<String>> scoped(List<List<String>> rows) {
+        List<List<String>> out = new ArrayList<>();
+        for (List<String> row : body(rows)) {
+            boolean typeOk = type == null || type.equals(cell(row, TYPE_POSITION));
+            boolean idOk = id == null || id.equals(cell(row, ID_POSITION));
+            if (typeOk && idOk) {
+                out.add(row);
+            }
+        }
+        return out;
+    }
+
+    private String scopeName() {
+        return id == null ? type : type + " id " + id;
+    }
+
+    private boolean matches(List<String> row, List<String> pattern) {
+        for (int i = 0; i < pattern.size(); i++) {
+            String p = pattern.get(i);
+            if (p != null && !same(cell(row, i), p.strip(), numericColumns.contains(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Canonical key so numeric columns compare by value, others as trimmed text. */
+    private String key(List<String> row) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < row.size(); i++) {
+            sb.append(numericColumns.contains(i) ? canonical(row.get(i)) : row.get(i)).append('|');
+        }
+        return sb.toString();
+    }
+
+    private static boolean same(String a, String b, boolean numeric) {
+        return numeric ? canonical(a).equals(canonical(b)) : a.equals(b);
+    }
+
+    private static String canonical(String value) {
+        try {
+            BigDecimal d = new BigDecimal(value);
+            return d.signum() == 0 ? "0" : d.stripTrailingZeros().toPlainString();
+        } catch (NumberFormatException e) {
+            return value;
+        }
+    }
+
+    private static String cell(List<String> row, int index) {
+        return index < row.size() ? row.get(index) : "";
+    }
+
+    private static String describe(List<String> positions) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < positions.size(); i++) {
+            if (positions.get(i) != null) {
+                sb.append("[").append(i).append("]='").append(positions.get(i)).append("' ");
+            }
+        }
+        return sb.toString().trim();
+    }
+
+    /** Removes BOM / NBSP / CR / padding, drops blank lines, splits on | keeping trailing empty fields. */
+    private static List<List<String>> normalise(List<String> lines) {
+        List<List<String>> out = new ArrayList<>();
+        for (String raw : lines) {
+            String s = raw.replace("﻿", "").replace(' ', ' ').strip();
+            if (s.isEmpty()) {
+                continue;
+            }
+            out.add(Arrays.stream(s.split(DELIMITER, -1)).map(String::strip).toList());
+        }
+        return out;
+    }
+}
+
